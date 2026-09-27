@@ -1,0 +1,596 @@
+# Tennis App — Product Vision & PRD
+
+## 1. Product Vision
+
+### Short-term vision
+
+> **Make it dramatically easier and more motivating for tennis players to fix good, social matches and play more tennis.**
+
+### Long-term direction
+
+Build the **social infrastructure for tennis**: a living network where players can find opponents, build relationships, understand their level, improve their game, track their progress, and continuously discover new opportunities to play.
+
+### The Core Product Loop
+
+**Want to play → Fix a match → Play → Record → Improve → Connect → Want to play again**
+
+Every match strengthens the player's tennis profile and network, creating more opportunities and motivation for the next match.
+
+### Product Thesis
+
+We are not fundamentally building an ELO app, tennis tracker, or social network.
+
+**We are building a product that helps people play more tennis.**
+
+ELO, social connections, match history, motivation, and discovery are mechanisms that make that happen.
+
+---
+
+# 2. The Core Job
+
+> **When I want to play tennis, help me quickly fix a good match with the right person, at the right time and place.**
+
+"Fix a match" means solving the full coordination problem:
+
+**Who? → When? → Where? → What format? → Confirmed.**
+
+The product should make this substantially easier than the current combination of WhatsApp, memory, contacts, and ad-hoc coordination.
+
+A key advantage is that the product manages **multiple potential opponents simultaneously**.
+
+Instead of:
+
+> "Hey João, want to play Saturday?"
+> "No."
+> "Hey Pedro..."
+> "Maybe."
+> "Hey Lucas..."
+> "Yes."
+> "Sorry Pedro, I already found someone."
+
+The user can define one opportunity:
+
+> **Saturday · 10:00 · Belvedere · Singles**
+
+and invite a **predefined group of people they would like to play with**.
+
+Once someone accepts and the match is confirmed, the opportunity closes automatically for everyone else.
+
+The app manages the coordination state so the user doesn't have to.
+
+---
+
+# 3. Target User
+
+### Primary user
+
+An active recreational tennis player who:
+
+* Plays regularly but struggles to consistently find opponents.
+* Relies heavily on WhatsApp and personal contacts to arrange matches.
+* Has a network of people they would happily play with.
+* Has some understanding of their own level but lacks an objective reference.
+* Would enjoy playing more frequently if finding the right opponent were easier.
+* Is open to expanding their tennis network.
+
+### Initial wedge
+
+**Existing tennis players with an existing tennis/social network.**
+
+We are not initially trying to solve how to get non-players into tennis.
+
+The initial question is:
+
+> **How do we help someone who already plays tennis turn more intentions to play into actual matches?**
+
+---
+
+# 4. Core Jobs To Be Done
+
+### Fix a match
+
+> When I want to play, help me quickly find the right person, time, and place.
+
+### Be available
+
+> When I know when and where I can play, help me find people in my network who also want to play.
+
+### Discover
+
+> When my usual opponents aren't available, help me find someone I would actually want to play with.
+
+### Understand my level
+
+> Help me understand how good I am and whether I'm improving.
+
+### Connect
+
+> Help me expand my tennis network through people I already know and people connected to them.
+
+### Play more
+
+> Make tennis more socially rewarding and motivating so I want to play more often.
+
+---
+
+# 5. Product Principles
+
+### 1. Tennis first
+
+Every feature should ultimately contribute to **more and better tennis matches**.
+
+### 2. Fixing a match is the wedge
+
+The product must solve a concrete problem before becoming a broader tennis network.
+
+### 3. Network before marketplace
+
+Start with the player's existing relationships and expand outward through **1st- and 2nd-degree connections**.
+
+### 4. Coordinate the network, don't just message it
+
+The product should manage invitations, availability, responses, and confirmation across multiple people.
+
+**One match opportunity → multiple potential players → one confirmed match.**
+
+### 5. Real-world actions > app engagement
+
+The primary outcome is not time spent in the app.
+
+**It is a match happening on a tennis court.**
+
+### 6. Low friction
+
+Fixing a match should feel easier than a WhatsApp conversation.
+
+### 7. Reputation emerges from play
+
+Don't ask users to build elaborate profiles.
+
+Their actual matches should progressively tell us who they are as players.
+
+### 8. Social, not performative
+
+Motivation should come from people, competition, and progress — not generic gamification.
+
+### 9. Good matches matter
+
+The goal isn't simply to maximize the number of matches.
+
+We want matches that are **appropriate, competitive, convenient, and socially enjoyable.**
+
+---
+
+# 6. MVP
+
+## A. Player Profile
+
+A lightweight tennis identity containing:
+
+* Name / photo
+* Tennis level
+* Rating
+* Preferred playing locations
+* Tennis connections
+* Match history
+
+The profile becomes richer automatically through usage.
+
+---
+
+## B. Tennis Connections & Match Lists
+
+Players should be able to build lightweight lists of people they would typically want to play with.
+
+Examples:
+
+* **Saturday players**
+* **Belvedere**
+* **Same level**
+* **Singles**
+* **Doubles**
+* **Friends**
+
+Although some lists may be based on tournaments, these are not necessarily formal groups or communities. They are simply **personal pools of potential opponents**.
+
+---
+
+## C. Fix a Match
+
+The core experience.
+
+A player can define:
+
+* **When** they want to play.
+* **Where** they want to play.
+* **Format**.
+* **Who they'd like to play with** — individually or through a saved list.
+
+### Example
+
+> **Saturday · 10:00 · Belvedere**
+>
+> Singles
+> Looking for an opponent
+>
+> **Invite Saturday players**
+
+The app sends the opportunity through the appropriate channel, including **WhatsApp and/or native notifications**.
+
+### Multi-person coordination
+
+The same match opportunity can be offered to multiple suitable players simultaneously.
+
+For example:
+
+**Guilherme wants to play Saturday at 10:00.**
+
+The app contacts:
+
+* João
+* Pedro
+* Lucas
+* Rafael
+* André
+
+Each person can respond:
+
+**I'm in / Maybe / Can't play**
+
+Once João accepts:
+
+**Match confirmed: Guilherme × João**
+
+The opportunity automatically closes for the other invitees.
+
+They don't need to be individually told:
+
+> "Sorry, I already found someone."
+
+This is a core product advantage over simply using WhatsApp.
+
+### Key outcome
+
+**Reduce the effort and time required to turn "I want to play" into a confirmed match.**
+
+---
+
+## D. Make Myself Available
+
+The reverse flow is equally important.
+
+A player can publish an availability:
+
+> **Saturday · 10:00 · Belvedere**
+> **Available to play**
+
+The app can then identify relevant connections who have expressed compatible availability or who are likely matches based on:
+
+* Location
+* Time
+* Level
+* Format
+* Existing relationship
+* Playing preferences
+
+For example:
+
+> **You and João are both available at Belvedere Saturday at 10:00.**
+>
+> **Fix a match**
+
+This turns the product from a simple **"find someone"** tool into a network that actively helps **compatible intentions collide**.
+
+---
+
+## E. Player Discovery
+
+Players can discover:
+
+* Existing tennis contacts.
+* Friends of tennis contacts.
+* Nearby players.
+* Players with compatible levels.
+* Players open to new opponents.
+
+The network should make the question:
+
+> **"Who could I play?"**
+
+easy to answer.
+
+Over time, the network should also surface:
+
+> **"Who is looking to play?"**
+
+---
+
+## F. Match Recording
+
+After a match:
+
+* Players confirm that the match happened.
+* Record the result.
+* Update match history.
+* Update rating.
+
+Recording should require **as little effort as possible**.
+
+---
+
+## G. Rating / Level
+
+Create a player rating based primarily on **actual match results**.
+
+The system should:
+
+* Establish an initial level.
+* Adjust rating after matches.
+* Show progression over time.
+* Help identify compatible opponents.
+
+Rating should support matchmaking and progression rather than become the product itself.
+
+---
+
+## H. Motivation
+
+Provide lightweight signals that encourage more playing:
+
+* Matches played.
+* Playing frequency.
+* Recent activity.
+* Personal progress.
+* Milestones.
+* Activity from people in the player's network.
+* Prompts to fix another match.
+* Opportunities from people who are available to play.
+
+Example:
+
+> **You've played 4 times this month.**
+
+> **João is available Saturday at Belvedere.**
+
+> **You haven't played Pedro in 3 weeks.**
+
+The goal is **action, not notification volume.**
+
+---
+
+# 7. North Star
+
+### Primary outcome
+
+**Verified tennis matches played per active player per month.**
+
+This is preferable to:
+
+* DAU
+* Time spent
+* Messages sent
+* Profiles viewed
+* Invitations sent
+
+because the product exists to facilitate **real-world tennis participation**.
+
+### Supporting metrics
+
+**Fixing matches**
+
+* Time from intent → confirmed match.
+* Match creation → confirmed match conversion.
+* Multi-invite → confirmed match conversion.
+* Invitation → acceptance rate.
+* Time from first invitation → confirmation.
+* Match cancellation rate.
+
+**Availability**
+
+* % of availability posts that result in a match.
+* Availability → connection/match conversion.
+* Matches created through mutual availability.
+
+**Activation**
+
+* % of users who fix/join their first match.
+* Time to first match.
+
+**Network**
+
+* Tennis connections per user.
+* % of matches involving a new connection.
+* 2nd-degree discovery → match conversion.
+
+**Retention**
+
+* Matches/player/month.
+* % of players who play again within 30 days.
+* Monthly active players who play ≥1 match.
+
+**Progression**
+
+* % of matches with confirmed results.
+* Rating participation.
+* Rating reliability over time.
+
+---
+
+# 8. Key Product Hypotheses
+
+These are hypotheses to validate, not assumptions.
+
+### H1 — Fixing a match is a meaningful pain
+
+Players regularly want to play but fail to convert that intention into a match because finding and coordinating with the right person is difficult.
+
+### H2 — Players already have latent opponent pools
+
+Most active players have several people they would happily play with, but this information currently lives in their memory and WhatsApp history.
+
+### H3 — Multi-person coordination materially reduces friction
+
+Players would prefer one match opportunity sent to several suitable people over sequentially messaging individuals and manually managing responses.
+
+### H4 — Existing networks are the strongest initial supply
+
+Players are more likely to play with people they already know or people connected to someone they trust.
+
+### H5 — Mutual availability can create matches
+
+If players can signal when and where they are available, the product can proactively identify compatible opportunities that would otherwise remain invisible.
+
+### H6 — Good matches are more valuable than generic matches
+
+Players care about compatibility across level, availability, location, format, and social fit.
+
+### H7 — Level compatibility increases match conversion
+
+Players are more willing to play when they understand whether the opponent is approximately their level.
+
+### H8 — Objective progression increases motivation
+
+Seeing improvement in rating and playing history can encourage players to play more frequently.
+
+### H9 — Social visibility creates additional playing opportunities
+
+Seeing what people in one's tennis network are doing can trigger additional matches.
+
+---
+
+# 9. Product Discovery
+
+Before building the full product, validate the core loop.
+
+### Research the current behavior
+
+Talk to active recreational players about:
+
+* Their last time trying to arrange a match.
+* How they found the opponent.
+* Who they typically consider when looking for a match.
+* Whether they usually message one person or several.
+* How they handle it when multiple people respond.
+* How much back-and-forth coordination was required.
+* Whether they would tell people in advance when they are available.
+* What happened when their usual opponent wasn't available.
+* How they determine someone's level.
+* How they discover new players.
+* Whether they track results.
+* What makes them play more or less frequently.
+
+Avoid asking:
+
+> "Would you use an app that does X?"
+
+Instead investigate **actual recent behavior**.
+
+### Current journey
+
+**Want to play → Think of potential opponents → Message one/multiple people → Coordinate → Confirm → Play → Record → Repeat**
+
+Map the friction at each step and identify which opportunities have the strongest evidence.
+
+---
+
+# 10. MVP Experience
+
+The first version should feel almost absurdly simple.
+
+### Home
+
+**"Want to play?"**
+
+* Fix a match
+* I'm available
+* Find an opponent
+
+### Fix a match
+
+**When? Where? Who?**
+
+→ Choose a person or list
+→ Send invitation
+→ Manage responses automatically
+→ Confirm
+→ **Match fixed**
+
+### Availability
+
+**"When are you available?"**
+
+→ Date/time
+→ Location
+→ Format
+→ **Make available**
+
+The app then looks for compatible people and opportunities.
+
+### After the match
+
+**"How did it go?"**
+
+* Result
+* Opponent confirmation
+* Rating update
+
+### Profile
+
+**"Your tennis"**
+
+* Level
+* Rating
+* Matches
+* Playing frequency
+* Connections
+
+### Network
+
+**"Your tennis network"**
+
+* People you know
+* People connected to people you know
+* Nearby compatible players
+* People currently available
+
+The product becomes increasingly valuable as the user's **tennis graph** grows.
+
+---
+
+# 11. Long-Term Product Direction
+
+Once the core loop works, expand around each stage:
+
+### Fix a match
+
+Scheduling, court booking, recurring matches, automatic availability, smarter matchmaking, intelligent opponent lists.
+
+### Play
+
+Match formats, doubles, leagues, tournaments, court experiences.
+
+### Record
+
+Richer statistics, automatic score capture, match analytics.
+
+### Improve
+
+ELO, goals, progression, coaching, training recommendations.
+
+### Connect
+
+Groups, communities, challenges, doubles partners, clubs.
+
+### Discover
+
+1st/2nd-degree network, nearby players, clubs, leagues, tournaments.
+
+### Play more
+
+Social feed, competitions, streaks, events, personalized prompts.
+
+The strategic filter for future features:
+
+> **Does this create more opportunities to play, increase the likelihood of playing, or make playing more rewarding?**
+
+If not, it probably doesn't belong in the core product.

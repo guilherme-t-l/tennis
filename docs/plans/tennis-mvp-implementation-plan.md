@@ -1,0 +1,617 @@
+# Tennis MVP — Implementation Plan
+
+- PRD: `PRD-and-product-vision` (repo root). Status: Approved. Build scope = §6 features A–H, §10 MVP Experience. Metrics per §7 are derived from the data model below (no analytics infra).
+- Audience: implementer, code-reviewer, tester, qa threads, and the technical PM who reads the directory map and the in-code comments. This document + the PRD are the only inputs they get.
+- Decisions fixed by the user (do not re-open): phased full MVP; Next.js App Router + TypeScript on Vercel; Firebase Auth + Cloud Firestore (Standard edition, Native mode) as the backend; invites via in-app inbox + `wa.me` share link (no WhatsApp Business API, no email); acceptance checks live here.
+
+## 1. Summary & phases
+
+The product is one Next.js app talking to one Firebase project. Players sign in with Firebase Auth email + password. All product writes go through server actions. The action verifies the session, checks the same allow/deny conditions as `firestore.rules`, then writes with the Firebase Admin SDK. Two multi-document transitions that must be atomic — accepting an invitation, and confirming a result plus the rating update — are Firestore transactions in `src/lib/firestore/`. Pure business rules (opportunity/invitation state, Elo, availability compatibility, WhatsApp link, motivation prompts) live in `src/lib/domain/*` as dependency-free TypeScript so they are unit-testable. There is one Elo implementation, in TypeScript; the confirm transaction calls it. Notifications are written in the same transaction as the change that caused them. Phases are ordered by dependency and the wedge: profile → connections/lists → fix a match, then recording/rating, then availability, then discovery/motivation.
+
+| Phase | PRD features | "Done" means | Depends on |
+|---|---|---|---|
+| 0 Scaffold | — | App boots on localhost against the emulators, sign up/in works, rules deploy to the emulator, seed + all test runners run green (empty suites allowed) | — |
+| 1 Wedge | A Profile, B Connections & Lists, C Fix a Match (multi-invite, auto-close), Inbox, `/i/[token]`, wa.me link | Checks 1–11 pass; unit + emulator tests for state machine, concurrency, token access, wa.me | 0 |
+| 2 Record & Rate | F Match Recording, G Rating/Level | Checks 12–14 pass; Elo unit tests; confirm-result emulator test matches `domain/elo.ts` | 1 |
+| 3 Availability | D Make Myself Available + mutual-availability suggestions | Checks 15–16 pass; compatibility unit tests + availability rules test | 1 (uses rating from 2 for level filter; falls back to initial rating) |
+| 4 Network & Motivation | E Player Discovery, H Motivation | Checks 17–20 pass; prompts unit tests | 1, 2, 3 |
+
+Each phase ends with a deployable `main` (Vercel preview OK) and all gates in §8.6 green. Deploying a phase also deploys `firestore.rules`, `firestore.indexes.json`, and the Auth provider config.
+
+## 2. Stack & project scaffold
+
+### Bootstrap (run from the repo root; the repo currently contains only the PRD and `.git`)
+
+```bash
+npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --import-alias "@/*" --use-npm --no-turbopack
+npm i firebase firebase-admin zod server-only
+npm i -D firebase-tools vitest @vitest/coverage-v8 @playwright/test tsx dotenv @firebase/rules-unit-testing
+npx playwright install chromium
+```
+
+Write these files by hand. Do not run `firebase init`; it expects interactive input.
+
+- `firebase.json` — Firestore rules + indexes, Auth email/password provider, emulator ports
+- `firestore.rules` — default deny, then the phase's allows
+- `firestore.indexes.json` — composite indexes in §3
+- `.firebaserc` — `{ "projects": { "default": "<project-id>" } }`
+
+`firebase.json` shape:
+
+```json
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "auth": {
+    "providers": {
+      "emailPassword": true
+    }
+  },
+  "emulators": {
+    "auth": { "port": 9099 },
+    "firestore": { "port": 8080 },
+    "ui": { "enabled": true, "port": 4000 },
+    "singleProjectMode": true
+  }
+}
+```
+
+Versions: whatever `create-next-app@latest` installs (Next 15+/React 19; if Next renamed `middleware.ts` to `proxy.ts`, use the new name). Do not pin older majors. Node 24 / npm 11 are installed locally. Invoke the CLI as `npx -y firebase-tools@latest`, including the `package.json` scripts.
+
+Firestore is the **Standard edition** default database (Native mode). Security rules, transactions, and `@firebase/rules-unit-testing` target that edition. When the database does not exist yet, ask the user which location to use before creating it (`npx -y firebase-tools@latest firestore:locations`). Suggest `southamerica-east1` because seed data and Playwright use `America/Sao_Paulo`. Put that location in `firebase.json` only if a non-default database id is required; otherwise create the default database in the chosen location and leave `firebase.json` on the default database.
+
+### Firebase: emulators locally, one hosted project for deploy
+
+The Firestore emulator needs a JDK (Temurin 21+). Docker is not required.
+
+1. Create a Firebase project, or use an existing project id the user provides. Do not invent an id. `npx -y firebase-tools@latest use <project-id>`.
+2. Enable Auth email/password by deploying the `auth` block: `npm run deploy:firebase`.
+3. In Authentication → Settings, turn off email-verification requirements and add `localhost` to Authorized domains (no protocol, no port).
+4. Local dev and every test run use the Auth emulator (9099) and the Firestore emulator (8080). `emulators:exec` sets `FIREBASE_AUTH_EMULATOR_HOST` and `FIRESTORE_EMULATOR_HOST` for the child process.
+5. `npm run seed` (`tsx scripts/seed.ts`) creates seeded users with the Admin Auth API and writes their documents. Against the emulator it needs no service-account file.
+
+Vercel and any hosted preview talk to the real project. They must not set the emulator host variables or `NEXT_PUBLIC_FIREBASE_EMULATOR`.
+
+### Env vars
+
+`.env.example` (committed) / `.env.local` (git-ignored, also read by Vitest and Playwright):
+
+| Var | Used by | Notes |
+|---|---|---|
+| `NEXT_PUBLIC_FIREBASE_API_KEY` | browser | Web app config. Any non-empty placeholder works against the emulator |
+| `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN` | browser | `<project-id>.firebaseapp.com` |
+| `NEXT_PUBLIC_FIREBASE_PROJECT_ID` | browser + Admin | `demo-tennis` locally; real project id on Vercel |
+| `NEXT_PUBLIC_FIREBASE_APP_ID` | browser | Web app id |
+| `NEXT_PUBLIC_FIREBASE_EMULATOR` | browser | `true` in `.env.local` only. Client SDK calls `connectAuthEmulator` / `connectFirestoreEmulator` |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | Admin SDK on Vercel, hosted seed | Full JSON in one env var. Never imported from a client component. Omit when the emulator hosts are set |
+| `NEXT_PUBLIC_APP_URL` | wa.me link, `/i/[token]` URLs | `http://localhost:3000` locally |
+| `E2E_USER_PASSWORD` | seed + tests | default `Password123!` |
+
+Vercel: set the public Firebase config, `FIREBASE_SERVICE_ACCOUNT_JSON`, and `NEXT_PUBLIC_APP_URL` (the preview or production origin). Do not set `NEXT_PUBLIC_FIREBASE_EMULATOR`.
+
+### Auth
+
+Firebase Auth **email + password**. Sessions are httpOnly cookies. Sign-up and sign-in happen in the browser SDK; a server action then exchanges the ID token for a session cookie.
+
+- Sign up: client `createUserWithEmailAndPassword`, then server action `completeSignUp` verifies the ID token with Admin Auth, writes `profiles/{uid}` (display name, self-declared level, initial rating from §4), and sets the cookie via `createSessionCookie`. A player with an Auth user and no profile is sent to `/signup` to finish.
+- Sign in: client `signInWithEmailAndPassword`, then server action `createSession` verifies the ID token and sets the cookie.
+- Cookie name `__session`, 5 days. `requireUser()` in `src/lib/firebase/session.ts` calls `verifySessionCookie` and returns the uid. Every server action and every authenticated server page calls it. The uid always comes from the cookie, never from the form body.
+- `src/middleware.ts` only checks that the cookie exists. It redirects signed-out visitors to `/login`. It does not import `firebase-admin` (Edge). Public routes: `/login`, `/signup`, `/i/[token]`. Missing the cookie is a redirect; a forged cookie fails in `requireUser()`.
+
+### Who writes what
+
+The Admin SDK bypasses security rules, so the action is the enforcement point and the rules are the backstop against the public web config.
+
+- Every server action calls `requireUser()`, then applies the allow/deny in §3, then writes with Admin.
+- `acceptInvitation` and `confirmResult` are Admin transactions. Client writes that would do the same thing are denied in rules.
+- Client SDK writes are denied except the narrow updates in §3 (own profile fields that are not the rating, invitation `maybe` / `out` / `none`, own availability, own lists). The app still performs those updates through server actions, using Admin, after the same checks. Rules tests hit the client SDK directly.
+
+### Directory layout
+
+**Read it in this order**
+
+- `src/lib/domain/opportunity.ts` — what happens when someone says "I'm in"
+- `src/app/(app)/page.tsx` and `src/app/(app)/fix/page.tsx` — what the player taps on Home and Fix a match
+- `src/lib/actions/invitations.ts` — how that tap becomes one confirmed match
+- `src/lib/firestore/accept-invitation.ts` — two people accepting at once still produce one confirmed match
+- `src/app/(public)/i/[token]/page.tsx` — the invite link stays read-only until that player signs in
+- `src/app/(app)/opportunities/[id]/page.tsx` — what the host and the other invitees see after "Match fixed"
+- `src/lib/domain/elo.ts` — how a confirmed singles result changes both ratings
+- `src/lib/firestore/confirm-result.ts` — confirming a singles result writes both ratings from `domain/elo.ts`
+
+```
+# Product rules (pure logic, no database)
+
+src/lib/domain/opportunity.ts   # First "I'm in" confirms the match and closes it for everyone else. Maybe and Can't play leave it open (C, Manage responses / Match fixed).
+src/lib/domain/elo.ts           # New rating after a confirmed singles result. Doubles results are stored and do not change ratings (G).
+src/lib/domain/availability.ts  # Same place, same format, at least 60 minutes in common, ratings within 200 (D).
+src/lib/domain/whatsapp.ts      # Text for Share on WhatsApp: name, format, when, where, and the invite link (C).
+src/lib/domain/prompts.ts       # At most three Home nudges: who is free, how often you played, who you have not played lately (H).
+src/lib/domain/level.ts         # Level name shown for a rating, and whether two ratings are close enough to suggest (G).
+
+# Screens the player sees
+# (auth), (app), and (public) are folders that do not appear in the address. Public addresses, open without signing in: /login, /signup, /i/[token].
+
+src/app/(auth)/login/page.tsx                    # Sign in with email and password. Public page.
+src/app/(auth)/signup/page.tsx                   # Sign up: display name and self-declared level, then /onboarding. Public page.
+src/app/(app)/onboarding/page.tsx                # Profile: pick preferred places. Can skip (A).
+src/app/(app)/page.tsx                           # Home "Want to play?": Fix a match, I'm available, Find an opponent, plus upcoming matches.
+src/app/(app)/fix/page.tsx                       # Fix a match: when, where, format, and who (C).
+src/app/(app)/opportunities/[id]/page.tsx        # Manage responses / Match fixed. Host sees each reply and Share on WhatsApp. Invitee taps I'm in, Maybe, or Can't play (C).
+src/app/(public)/i/[token]/page.tsx              # Public invite. Read-only until the invited player signs in, then the same response buttons (C).
+src/app/(app)/inbox/page.tsx                     # Notifications. Each item opens the request, match, or result it is about.
+src/app/(app)/matches/[id]/page.tsx              # After the match "How did it go?": record a result, or confirm or dispute it (F, G).
+src/app/(app)/available/new/page.tsx             # Make myself available: date, start, end, place, format (D).
+src/app/(app)/available/page.tsx                 # My times, plus cards "You and X are both available…" that open Fix a match (D).
+src/app/(app)/profile/page.tsx                   # Profile "Your tennis": name, level, rating, history, places (A, G).
+src/app/(app)/players/[id]/page.tsx              # Another player's profile. Availability shows only if you are connected (A, D).
+src/app/(app)/network/page.tsx                   # Network "Your tennis network": people you know, friends of friends, nearby, currently available (B, E).
+src/app/(app)/network/lists/page.tsx             # Match lists: named groups of people you already know (B).
+src/app/(app)/network/lists/[id]/page.tsx        # One list. Add or remove people, or fix a match with the whole list (B).
+
+# What a tap saves or loads
+
+# Connections
+src/lib/actions/connections.ts      # Ask to connect, or accept a request (B, People you know).
+
+# Lists
+src/lib/actions/lists.ts            # Create a list and add people from accepted connections (B, Match lists).
+
+# Fix a match
+src/lib/actions/opportunities.ts    # Create an opportunity and its invitations, or cancel while it is still open (C, Fix a match).
+
+# Invitations
+src/lib/actions/invitations.ts      # I'm in, Maybe, or Can't play. Only the signed-in invitee can respond. I'm in confirms the match (C).
+src/lib/firestore/accept-invitation.ts  # Transaction: lock the opportunity by rewriting it, create the one match whose id is the opportunity id.
+
+# Results
+src/lib/actions/results.ts          # Record a winner and score, or confirm or dispute the other player's report (F, How did it go?).
+src/lib/firestore/confirm-result.ts # Transaction: confirm, mark the match played, apply domain/elo.ts to both profiles.
+src/lib/actions/matches.ts          # Cancel a scheduled match. The opportunity stays confirmed.
+
+# Availability
+src/lib/actions/availabilities.ts   # Publish or cancel a time you can play. On publish, write availability_match notifications for each compatible connection (D).
+src/lib/queries/availabilities.ts   # Load one connection's active times at a time, then domain/availability.ts decides the match (D).
+
+# Notifications
+src/lib/actions/notifications.ts    # Mark an inbox item read.
+
+# Account
+src/lib/actions/auth.ts             # Sign up and sign in. completeSignUp creates the profile.
+
+# Profile
+src/lib/actions/profile.ts          # Save name, preferred places, and whether you are open to new players (A, Profile).
+
+# Discovery
+src/lib/queries/network.ts          # People connected to people you know, nearby compatible players, and connections free in the next 7 days (E, Network).
+
+# Who is allowed to see what
+
+firestore.rules                        # Default deny. Grows each phase. inviteLinks/{token} is the only unauthenticated read, and only by document id.
+firestore.indexes.json                 # Composite indexes for the queries in §3.
+
+# How we know it works
+
+tests/unit/       # Product rules in src/lib/domain, with no database (§8.2).
+tests/db/         # Rules via the client SDK, plus Admin transactions, against the emulators (§8.3).
+tests/e2e/        # The acceptance checks in §8.4, clicked through in a browser.
+scripts/seed.ts   # Sample players (Guilherme, João, Pedro, Lucas, Rafael, André) so those checks have someone to sign in as.
+
+# Plumbing a PM can skip on a first read
+
+src/lib/firebase/client.ts    # Browser Firebase app. Connects to the emulators only when NEXT_PUBLIC_FIREBASE_EMULATOR=true.
+src/lib/firebase/admin.ts     # Admin app. server-only. Used by actions, scripts/seed.ts, and tests/db. Uses the emulator when FIRESTORE_EMULATOR_HOST is set.
+src/lib/firebase/session.ts   # requireUser(): verify the session cookie, return uid.
+src/lib/firestore/types.ts    # Hand-written document shapes. Not a product rule.
+src/middleware.ts             # Cookie present → allow. Signed-out visitors may open only /login, /signup, and /i/[token].
+src/components/               # Shared buttons and layout. What the player can do is decided by the screens and rules above.
+```
+
+**Words used below**
+
+- **security rules** — who may read or change a document, in `firestore.rules`. The client SDK obeys them. The Admin SDK does not.
+- **transaction** — one Admin SDK `runTransaction` that commits several document writes together, or commits none of them. `acceptInvitation` and `confirmResult` are transactions.
+- **server action** — the server function behind a button or form that saves or loads data (`src/lib/actions`).
+- **token** — the unguessable id in an invite link, `/i/[token]`. It is the document id of `inviteLinks/{token}`. It opens that invitation. It does not sign anyone in.
+- **pair id** — the two player uids sorted and joined with `_`. Document id of `connectionPairs/{pairId}`.
+
+`package.json` scripts: `dev`, `dev:emu` (`NEXT_PUBLIC_FIREBASE_EMULATOR=true npx -y firebase-tools@latest emulators:exec --only auth,firestore "next dev"`), `build`, `lint`, `typecheck` (`tsc --noEmit`), `test` (`vitest run tests/unit`), `test:db` (`npx -y firebase-tools@latest emulators:exec --only auth,firestore "vitest run tests/db"`), `test:e2e` (`npx -y firebase-tools@latest emulators:exec --only auth,firestore "playwright test"`), `seed`, `deploy:firebase` (`npx -y firebase-tools@latest deploy --only firestore:rules,firestore:indexes,auth`).
+
+### Comments in the code
+
+`#` comments belong in this plan's directory map and in shell snippets. `firestore.rules` uses `//` comments. TypeScript and TSX files must use `//` comments. A `#` line inside a `.ts` or `.tsx` file will not compile. The wording rules are the same either way.
+
+Put the comment immediately above the relevant part, not trailing after it, on:
+
+- the top of every file in `src/lib/domain`, `src/lib/actions`, `src/lib/queries`, `src/lib/firestore`, every `src/app/**/page.tsx`, and the top of `firestore.rules`
+- every exported function that encodes a product rule (state changes, who can respond, auto-close when the first "I'm in" closes it for everyone else, the rating math in §4, availability match, WhatsApp link text, motivation prompts)
+- every UI region that maps to a §10 screen block (the three home actions, response buttons, "Match fixed", record/confirm result, suggestion card)
+
+Write 1–3 lines in product language. State the player-visible rule and the outcome. Use the PRD's words ("I'm in", "Match fixed", "closes for everyone else"). Do not restate the next line of code. Do not narrate framework mechanics.
+
+```
+// src/lib/domain/opportunity.ts
+// The first "I'm in" confirms the match and closes it for everyone else.
+// Other invitees then see "Closed — {host} fixed this match with someone else".
+
+// src/lib/actions/invitations.ts — above the accept path
+// The invitee must be signed in to respond. The token page is read-only until then.
+// "I'm in" confirms this match. "Maybe" and "Can't play" leave it open.
+
+// src/lib/firestore/accept-invitation.ts — above acceptInvitation
+// Two people accepting at once still produce exactly one confirmed match.
+// The match document id is the opportunity id, so a second create cannot land.
+```
+
+## 3. Data model
+
+Cloud Firestore, Standard edition, default database. Document fields are camelCase. Timestamps are Firestore `Timestamp`s. Document ids are noted in the table; otherwise auto-id. Enums are strings. Every collection starts from default deny in `firestore.rules`. "Connected(a, b)" means `connectionPairs/{pairId}` exists and `status == 'accepted'`. Rules read that one document with `get()`.
+
+The client SDK may only run queries whose `where` clauses match a read rule. A query that might return a document the reader cannot access fails the whole query. The query shapes below are the ones the app is allowed to run.
+
+| Collection | Id | Fields | Rules intent | Allowed queries |
+|---|---|---|---|---|
+| `profiles` | Auth uid | `displayName`, `displayNameLower`, `avatarUrl`, `selfLevel` (`beginner`/`intermediate`/`advanced`), `rating`, `ratedMatches` (default 0), `openToNew` (default true), `city`, `locationIds` (array), `createdAt` | GET/LIST: any signed-in player. CREATE: Admin only, from `completeSignUp`, rating = initial for level (§4). UPDATE: own row, and the write must leave `rating` and `ratedMatches` unchanged. Those two fields change only inside `confirmResult` | get by id; `displayNameLower` prefix range; `openToNew == true`; `locationIds` array-contains a place id |
+| `locations` | slug of the name | `name`, `city`, `createdAt` | GET/LIST: signed in. CREATE: signed in, id is the slug, `name` unique because it is the id | list |
+| `connections` | auto | `requesterId`, `addresseeId`, `participantIds` (both uids), `pairId`, `status` (`pending`/`accepted`/`declined`), `respondedAt`, `createdAt` | GET/LIST: uid in `participantIds`. CREATE: requester is uid, status `pending`, requester ≠ addressee, no existing pair doc. UPDATE: addressee only, status to `accepted` or `declined`. On accept, the action also writes `connectionPairs/{pairId}` | `participantIds` array-contains uid |
+| `connectionPairs` | `{uidA}_{uidB}` sorted | `status`, `connectionId` | GET: signed in (rules need this for the connection check). WRITE: Admin only, and only when the matching connection is accepted | get by pair id |
+| `matchLists` | auto | `ownerId`, `name`, `nameKey` (ownerId + normalized name), `memberIds`, `createdAt` | All operations: owner only. The action refuses a member who is not an accepted connection, and refuses a duplicate `nameKey` | `ownerId == uid` |
+| `opportunities` | auto | `hostId`, `participantIds` (host + invitees), `startsAt`, `durationMin` (default 90), `locationId`, `locationName`, `format` (`singles`/`doubles`), `note`, `status` (`open`/`confirmed`/`cancelled`), `confirmedInvitationId`, `createdAt` | GET/LIST: uid in `participantIds`. CREATE: host is uid, status `open`. Client UPDATE: host only, and only `open` → `cancelled` plus `note`. `confirmed` is written only inside `acceptInvitation` | `participantIds` array-contains uid |
+| `invitations` | auto | `opportunityId`, `hostId`, `inviteeId`, `token`, `response` (`none`/`in`/`maybe`/`out`), `respondedAt`, `createdAt` | GET/LIST: uid is `hostId` or `inviteeId`. CREATE: Admin only, from the host's create-opportunity action, invitee ≠ host, opportunity `open`. Client UPDATE: invitee only, response in `none`/`maybe`/`out`, and only while the opportunity is `open`. Response `in` is denied; it happens only inside `acceptInvitation` | host: `hostId == uid` and `opportunityId == id`. Invitee: `inviteeId == uid` |
+| `inviteLinks` | token (18 random bytes, hex) | `startsAt`, `durationMin`, `format`, `status`, `locationName`, `hostDisplayName`, `hostAvatarUrl`, `inviteeDisplayName`, `inviteeId`, `invitationId`, `opportunityId`, `response` | GET by id: anyone, including signed-out visitors. LIST: denied. WRITE: Admin only. The document has no host uid, no note, no other invitees. The action updates `status` and `response` in the same transaction as the opportunity | get `inviteLinks/{token}` only |
+| `matches` | **opportunity id** | `opportunityId`, `hostId`, `opponentId`, `participantIds`, `startsAt`, `locationId`, `locationName`, `format`, `status` (`scheduled`/`played`/`cancelled`), `createdAt` | GET/LIST: uid in `participantIds`. CREATE: Admin only, inside `acceptInvitation`. The id is the opportunity id, so a second match for that opportunity cannot be created. UPDATE: a participant may set `scheduled` → `cancelled` only | `participantIds` array-contains uid |
+| `results` | **match id** | `matchId`, `reportedBy`, `winnerId`, `score` (free text, ≤ 40 chars), `status` (`pending`/`confirmed`/`disputed`), `confirmedBy`, `confirmedAt`, `createdAt` | GET: a participant of the match. CREATE: reporter is uid, uid is a participant, `startsAt` is in the past, winner is a participant. Client UPDATE: the other participant may set `pending` → `disputed` only. `confirmed` is written only inside `confirmResult` | get by match id |
+| `ratingHistory` | auto | `profileId`, `matchId`, `opponentId`, `opponentName`, `ratingBefore`, `ratingAfter`, `delta`, `createdAt` | GET/LIST: any signed-in player. WRITE: Admin only, inside `confirmResult` | `profileId == id` order by `createdAt` desc |
+| `availabilities` | auto | `profileId`, `startsAt`, `endsAt`, `locationId`, `locationName`, `format`, `note`, `status` (`active`/`cancelled`), `createdAt` | GET/LIST: owner, or a player who is connected to `profileId`. The query must name one `profileId`. CREATE/UPDATE: owner, `endsAt` > `startsAt` | `profileId == uid` and `status == active`. For someone else: `profileId == their id` and `status == active`, and `isConnected` |
+| `notifications` | auto | `profileId`, `type`, `title`, `body`, `href`, `readAt`, `createdAt` | GET/LIST: owner. UPDATE: owner, and only `readAt`. CREATE: Admin only, inside the action that caused it | `profileId == uid` order by `createdAt` desc |
+
+Notification writes, all inside the same Admin batch or transaction as the causing change:
+
+| Cause | Recipients | `type` |
+|---|---|---|
+| Invitation created | invitee | `invitation_received` |
+| Opportunity confirmed | host and the confirmed invitee | `match_confirmed` |
+| Opportunity confirmed | every other invitee | `opportunity_closed` |
+| Opportunity cancelled | invitees | `opportunity_cancelled` |
+| Result created | the other participant | `result_reported` |
+| Result confirmed | the reporter | `result_confirmed` |
+| Connection requested | addressee | `connection_requested` |
+| Connection accepted | requester | `connection_accepted` |
+| Availability published and compatible | both players | `availability_match` |
+
+### Transactions
+
+Both use Admin `runTransaction`. Firestore retries the whole function when two of them touch the same documents. All reads happen before writes.
+
+| Function | Behaviour |
+|---|---|
+| `acceptInvitation(uid, invitationId)` | Load the invitation. Caller must be `inviteeId`. Load the opportunity. If `status != 'open'` return `{ok:false, reason:'closed'}`. If `startsAt <= now` return `{ok:false, reason:'expired'}`. In the same transaction: set the opportunity to `confirmed` with `confirmedInvitationId`; set this invitation's `response` to `in`; `create` `matches/{opportunityId}` (a second create throws and the transaction aborts); set every `inviteLinks/{token}` for this opportunity (`status`, and `response` on the winner); write `match_confirmed` and `opportunity_closed` notifications. Return `{ok:true, matchId: opportunityId}`. |
+| `respondToInvitation(uid, invitationId, response)` | `in` calls `acceptInvitation`. `maybe` and `out` update the invitation and its `inviteLinks` doc while the opportunity is `open`. Caller must be the invitee. |
+| `respondViaToken(uid, token, response)` | Load `inviteLinks/{token}`. If `uid` is not `inviteeId`, return `{ok:false, reason:'not_invitee'}`. Otherwise delegate to `respondToInvitation`. |
+| `confirmResult(uid, resultId)` | Caller must be the participant who did not report. If status is already `confirmed`, return `{ok:false, reason:'already_confirmed'}`. Set the result `confirmed` and the match `played`. When `format == 'singles'`, call `domain/elo.ts` for each player with their own K, write both `profiles` ratings and `ratedMatches`, and add two `ratingHistory` documents. Doubles stores the confirmed result and leaves ratings unchanged. |
+
+### State machines
+
+Opportunity: `open` → `confirmed` through `acceptInvitation`; `open` → `cancelled` by the host; an `open` opportunity with `startsAt <= now` is displayed as **expired** (derived, no stored state, no scheduled job; `effectiveStatus(opp, now)` in `domain/opportunity.ts`; the transaction also refuses accepts after start). `confirmed` and `cancelled` are terminal. A confirmed match can itself be cancelled (`matches.status = cancelled`); the opportunity stays confirmed.
+
+Invitation `response`: `none` → `in` | `maybe` | `out`; `maybe` ↔ `out` ↔ `none` while the opportunity is open; `in` only through `acceptInvitation` and only while open; no changes after the opportunity leaves `open`. Displayed state is derived by `invitationView(opp, inv, now)`:
+
+| Condition | View |
+|---|---|
+| opp confirmed, `confirmedInvitationId = inv.id` | `you_are_in` (Match fixed) |
+| opp confirmed, other invitation | `closed_fixed_with_other` ("Closed — {host} fixed this match with someone else") |
+| opp cancelled | `closed_cancelled` |
+| opp open, startsAt ≤ now | `closed_expired` |
+| opp open, response none | `awaiting` (buttons I'm in / Maybe / Can't play) |
+| opp open, response maybe / out | `maybe` / `declined` (can still change; "I'm in" still available) |
+
+Auto-close rule: the first `in` confirms and closes the opportunity for everyone else in one transaction; the other invitees' view flips to `closed_fixed_with_other` and they receive an `opportunity_closed` notification. Host's page shows "Match fixed: {host} × {opponent}".
+
+### Composite indexes (`firestore.indexes.json`)
+
+Single-field indexes are automatic. Add these composites in the phase that introduces the query:
+
+| Phase | Collection | Fields |
+|---|---|---|
+| 1 | `notifications` | `profileId` ASC, `createdAt` DESC |
+| 1 | `invitations` | `hostId` ASC, `opportunityId` ASC |
+| 1 | `matches` | `participantIds` ARRAY, `startsAt` ASC |
+| 2 | `ratingHistory` | `profileId` ASC, `createdAt` DESC |
+| 3 | `availabilities` | `profileId` ASC, `status` ASC, `endsAt` ASC |
+| 4 | `profiles` | `openToNew` ASC, `displayNameLower` ASC |
+
+## 4. Rating algorithm (`src/lib/domain/elo.ts`, called by `confirmResult`)
+
+- Initial rating from self-declared level at sign-up: beginner **1200**, intermediate **1500**, advanced **1800**.
+- Expected score \(E_a = 1 / (1 + 10^{(R_b - R_a)/400})\).
+- K-factor: **40** while `ratedMatches < 5` (provisional), **24** afterwards. Each player uses their own K.
+- `newRating = Math.round(R + K * (S - E))`, `S` = 1 for winner, 0 for loser. Only `singles` results with `status=confirmed` change ratings. Doubles results are stored but unrated.
+- Level label (`domain/level.ts`, `levelForRating`): `< 1300` Beginner · `1300–1499` Improver · `1500–1699` Intermediate · `1700–1899` Strong · `≥ 1900` Advanced.
+- Compatible level for matching/discovery: `|Ra − Rb| ≤ 200`.
+
+Reference values for tests (both K=24 unless noted): 1500 v 1500, A wins → A 1512, B 1488. 1500 v 1700, A (1500) wins → A 1518, B 1682. 1500 v 1700, B wins → A 1494, B 1706. Provisional A (K=40, `ratedMatches`=0) 1500 beats 1500 (K=24) → A 1520, B 1488. `tests/db/confirm-result.test.ts` runs these inputs through `confirmResult` and asserts the stored ratings equal `domain/elo.ts`.
+
+## 5. Mutual availability matching
+
+Two stages: **one query per connection, then the pure TypeScript rule.**
+
+1. `queries/availabilities.ts`: load the signed-in player's accepted connections. For each connection id, query `availabilities` where `profileId == that id`, `status == active`, and `endsAt > now`. A single `profileId` equality is what the read rule can prove. Run those queries in parallel. Batch at 30 connections per wave so the MVP stays inside comfortable read limits. Join each row with that player's `rating` from `profiles`.
+2. `isCompatible(a, b, ratingA, ratingB): boolean` in `domain/availability.ts`: same `locationId` AND same `format` AND overlap ≥ **60 min** AND `|ratingA − ratingB| ≤ 200`. Also `overlapWindow(a, b)` returns the shared `[start, end)` used to prefill "Fix a match".
+3. The publish action, after it writes the new availability, runs the same rule and writes an `availability_match` notification to both players ("You and João are both available at Belvedere Saturday at 10:00"). The suggestion card links to `/fix?with=<profileId>&at=<iso>&location=<id>&format=<f>`.
+
+Also used as the "likely matches" source for §6 Network → "People currently available" (any active availability in the next 7 days from a connection).
+
+## 6. Screens / routes (App Router)
+
+| Route | PRD §10 | Content |
+|---|---|---|
+| `/login`, `/signup` | — | Email+password; sign-up collects display name + self level; redirects to `/onboarding` |
+| `/onboarding` | Profile | Pick preferred locations (skippable) |
+| `/` | Home "Want to play?" | 3 CTAs (Fix a match → `/fix`, I'm available → `/available/new`, Find an opponent → `/network`); upcoming matches; matches awaiting result/confirmation; motivation prompts (Phase 4) |
+| `/fix` | Fix a match | Single form: when (date, time, duration), where (location select/add), format, who (multi-select of connections and/or lists — lists expand to members, deduped). Submit → creates opportunity + invitations + `inviteLinks` → `/opportunities/[id]` |
+| `/opportunities/[id]` | Manage responses / Match fixed | Host view: details, per-invitee response chips (Awaiting / Maybe / Can't / **In**), per-invitee "Share on WhatsApp" (`wa.me`) button, Cancel. When confirmed: "Match fixed: X × Y" + link to `/matches/[id]`. Invitee view: same details + response buttons per `invitationView` |
+| `/i/[token]` | (public invite) | Anonymous: details from `inviteLinks/{token}` + "Sign in to respond". Signed in as invitee: I'm in / Maybe / Can't play → `respondViaToken`. Signed in as someone else: read-only + "This invite was sent to {name}". Unknown token: not found |
+| `/inbox` | (notifications) | List of notifications, unread badge in nav, mark read on click, each links to `href` |
+| `/matches/[id]` | After the match "How did it go?" | Details; after `startsAt`: "Record result" (winner + score) for either participant; opponent sees "Confirm" / "Dispute"; shows rating change once confirmed |
+| `/available/new`, `/available` | Availability | Form (date, start/end, location, format) → "Make available"; list of my availabilities with suggestion cards "You and X are both available…" → Fix a match |
+| `/profile`, `/players/[id]` | Profile "Your tennis" | Name/photo, level label + rating, rating history (simple list/sparkline), matches played, frequency (last 30 days), connections count, preferred locations, match history. Own profile: edit name, locations, `openToNew`. Self-declared level is editable only while `ratedMatches == 0` (the label only; rating stays the initial value until results confirm) |
+| `/network` | Network "Your tennis network" | Tabs: People you know (accepted + pending requests), People connected to people you know (2nd degree), Nearby compatible (shares a preferred location AND level within 200 AND `openToNew`), Currently available (connections with active availability ≤ 7 days). Search by name prefix → Connect |
+| `/network/lists`, `/network/lists/[id]` | Match lists | Create/rename/delete list; add/remove members from accepted connections; "Fix a match with this list" → `/fix?list=<id>` |
+
+No REST API service: server actions in `src/lib/actions/*` (Zod-validated inputs) and the two Admin transactions. No route handlers.
+
+Discovery reads (`queries/network.ts`), all bounded in TypeScript after the queries rules allow:
+
+- People you know: `connections` where `participantIds` array-contains uid.
+- 2nd degree: for each accepted connection, that same query, then drop me, drop 1st-degree uids, and keep one mutual friend's display name.
+- Nearby compatible: for each of my `locationIds`, `profiles` where `locationIds` array-contains that id and `openToNew == true`, then drop anyone whose rating is more than 200 away and drop existing connections.
+- Name search: `profiles` where `displayNameLower` is in the prefix range of the typed string.
+- Currently available: the availability queries in §5, limited to windows that overlap the next 7 days.
+
+## 7. Per-phase implementation steps (each = one commit)
+
+### Phase 0 — Scaffold
+1. `create-next-app` + deps + the Firebase config files in §2. Add `.env.example`, `.gitignore` entries (`.env.local`, `test-results/`, `playwright-report/`, `firebase-debug.log`).
+2. `firestore.rules` and `firestore.indexes.json` for `profiles` and `locations` (default deny, then those allows). `src/lib/firestore/types.ts`. Ask for the Firestore location, create the default Standard database if needed, `npm run deploy:firebase` against the hosted project once. Local work uses the emulators.
+3. `src/lib/firebase/{client,admin,session}.ts`, `src/middleware.ts`, `src/app/(auth)/login`, `signup`, `src/lib/actions/auth.ts`, `/onboarding`, app shell layout with nav (Home, Fix, Available, Network, Inbox, Profile).
+4. `scripts/seed.ts` (users + locations; extended each phase), `vitest.config.ts` (two projects: unit, db), `playwright.config.ts` (`webServer: npm run dev` with `NEXT_PUBLIC_FIREBASE_EMULATOR=true` and the emulator hosts inherited from `emulators:exec`, `globalSetup` runs seed, `workers: 1`, `fullyParallel: false`), `tests/e2e/helpers/auth.ts` (login via UI, cache `storageState` per user).
+5. `README.md` (§9), copying the "Read it in this order" list from §2 into it, `tests/e2e/phase0.spec.ts` (check 1). Gate: §8.6 Phase 0.
+
+### Phase 1 — Wedge
+6. Extend `firestore.rules` and indexes for `connections`, `connectionPairs`, `matchLists`, `opportunities`, `invitations`, `inviteLinks`, `matches`, `notifications`.
+7. `domain/opportunity.ts` (`effectiveStatus`, `invitationView`, `canRespond`) + `tests/unit/opportunity.test.ts`.
+8. `domain/whatsapp.ts` (`buildInviteMessage`, `buildWhatsAppShareUrl`) + `tests/unit/whatsapp.test.ts`.
+9. `actions/connections.ts` + `/network` (People you know tab + search + request/accept). Seed: connections and their `connectionPairs`.
+10. `actions/lists.ts` + `/network/lists`, `/network/lists/[id]`. Seed: "Saturday players".
+11. `actions/opportunities.ts` (create with list/individual expansion, cancel, write invitations and invite links) + `/fix`.
+12. `firestore/accept-invitation.ts`, `actions/invitations.ts` + `/opportunities/[id]` (host + invitee views, wa.me buttons).
+13. `/i/[token]` public page, reading `inviteLinks/{token}`.
+14. `actions/notifications.ts` + `/inbox` + nav unread badge (an `onSnapshot` listener on the player's notifications is optional; page revalidation is the baseline).
+15. `/profile`, `/players/[id]` (A: name, level, rating, locations, connections; matches list is empty until Phase 2), profile edit.
+16. `tests/db/rules.test.ts`, `tests/db/accept-concurrency.test.ts`, `tests/db/token.test.ts`; `tests/e2e/phase1.spec.ts` (checks 2–11). Seed: Pedro's open opportunity inviting Guilherme + João. Gate.
+
+### Phase 2 — Record & rate
+17. Extend rules and indexes for `results` and `ratingHistory`. Profile update rule rejects changes to `rating` and `ratedMatches`.
+18. `domain/elo.ts`, `domain/level.ts` + `tests/unit/elo.test.ts`, `tests/unit/level.test.ts`.
+19. `firestore/confirm-result.ts`, `actions/results.ts` + `/matches/[id]` (record / confirm / dispute, rating delta display). `tests/db/confirm-result.test.ts`.
+20. Profile: match history, rating history, matches played, frequency. Home: "awaiting result/confirmation" section. Seed: 3 played+confirmed matches for Guilherme (2 × João, 1 × Pedro 25 days ago) with rating history produced by `domain/elo.ts`.
+21. `tests/e2e/phase2.spec.ts` (12–14). Gate.
+
+### Phase 3 — Availability
+22. Extend rules and indexes for `availabilities`.
+23. `domain/availability.ts` + `tests/unit/availability.test.ts`.
+24. `actions/availabilities.ts` (publish writes `availability_match` notifications using the §5 rule), `queries/availabilities.ts`, `/available/new`, `/available` (suggestion cards → `/fix?with=…` prefill). `/fix` reads prefill params.
+25. `tests/db/availability-rules.test.ts`; seed: João active availability next Saturday 10:00–12:00 Belvedere singles. `tests/e2e/phase3.spec.ts` (15–16). Gate.
+
+### Phase 4 — Network & motivation
+26. `queries/network.ts` as specified in §6. `/network` remaining tabs.
+27. `domain/prompts.ts` (`buildPrompts({matchesLast30d, lastPlayedByOpponent, connectionAvailabilities, now})` → ordered list ≤ 3) + `tests/unit/prompts.test.ts`. Home renders prompts with CTAs.
+28. Seed: Rafael (2nd degree via João, Belvedere, openToNew), André (unconnected). `tests/e2e/phase4.spec.ts` (17–20). Gate.
+
+## 8. Testing the implementation must pass
+
+### 8.1 Test commands (tester stage runs all; all must be green)
+
+| Command | What | Preconditions |
+|---|---|---|
+| `npm run lint` | ESLint (create-next-app config) | — |
+| `npm run typecheck` | `tsc --noEmit` | — |
+| `npm test` | Vitest unit (`tests/unit`) | — |
+| `npm run test:db` | Vitest emulator tests (`tests/db`). `emulators:exec` starts Auth + Firestore | JDK 21+; `npm run seed` is invoked by the db setup, or the suite seeds inside the emulator |
+| `npm run test:e2e` | Playwright (`tests/e2e`) inside `emulators:exec`. Starts `npm run dev` itself, reseeds in `globalSetup` | JDK 21+; `.env.local` |
+| `npm run build` | Next production build | — |
+
+`tests/db` rules cases use `@firebase/rules-unit-testing` against the already running emulator (`127.0.0.1:8080`), signed in as seeded users. Transaction cases import `acceptInvitation` / `confirmResult` and run them with the Admin SDK. The Admin app points at the emulator whenever `FIRESTORE_EMULATOR_HOST` is set, with project id `demo-tennis` and no service account.
+
+### 8.2 Unit tests (Vitest, `tests/unit/`)
+
+| File | Cases |
+|---|---|
+| `opportunity.test.ts` | `effectiveStatus`: open & future → open; open & past → expired; confirmed/cancelled unchanged by time. `invitationView`: each row of the §3 table; `canRespond('in')` false when expired/confirmed/cancelled; `maybe→out→none` allowed while open; nothing allowed after confirmed. `expandInvitees(lists, individuals)` dedupes and excludes host |
+| `whatsapp.test.ts` | `buildInviteMessage` includes invitee first name, format, localized date/time, location, invite URL `${APP_URL}/i/${token}`; `buildWhatsAppShareUrl` starts with `https://wa.me/?text=`, text is `encodeURIComponent`-encoded (spaces `%20`, `:` in URL `%3A`, `/` `%2F`, newline `%0A`), decoding round-trips to the exact message; no phone number in URL |
+| `elo.test.ts` | `expectedScore(1500,1500)=0.5`; `expectedScore(1500,1700)≈0.2403`; the four reference results in §4; K selection (`ratedMatches` 0..4 → 40, 5 → 24); symmetric case sums to zero when both K equal; rating never NaN; doubles → `applyResult` returns unchanged ratings |
+| `level.test.ts` | `initialRating` for the 3 levels; `levelForRating` boundaries 1299/1300/1499/1500/1699/1700/1899/1900; `isCompatibleLevel(1500,1700)=true`, `(1500,1701)=false` |
+| `availability.test.ts` | same location/format/60-min overlap/within 200 → true; different location → false; different format → false; 45-min overlap → false; 60-min exactly → true; rating gap 201 → false; `overlapWindow` returns intersection; own availability excluded by caller (documented) |
+| `prompts.test.ts` | 3 matches in 30 days → "You've played 3 times in the last 30 days"; 0 → "Fix your first match this month" CTA; opponent last played 25 days ago → "You haven't played Pedro in 3 weeks"; connection availability within 7 days → "João is available Saturday at Belvedere"; output ≤ 3 prompts, ordered: availability > frequency > stale opponent; deterministic for fixed `now` |
+
+### 8.3 Emulator tests (Vitest, `tests/db/`)
+
+| File | Cases |
+|---|---|
+| `rules.test.ts` | With the client SDK: André cannot read Guilherme's `matchLists`, `notifications`, or `availabilities`; Guilherme can read João's profile but cannot update it; André cannot read Pedro's opportunity (not a participant); Guilherme (invited) can; invitee cannot update `invitations.response` to `in`, and can set `maybe`; client cannot create `matches`, `results`, `ratingHistory`, `notifications`, or `inviteLinks`; client cannot update own `profiles.rating`; host cannot update `opportunities.status` to `confirmed`. Signed-out get of `inviteLinks/{token}` succeeds. Signed-out list of `inviteLinks` fails. Signed-out get of `invitations` fails |
+| `accept-concurrency.test.ts` | Create an opportunity with 2 invitations (Admin). Fire `acceptInvitation` for both invitees with `Promise.all`. Exactly one `{ok:true}`, the other `{ok:false, reason:'closed'}`. Exactly one `matches/{opportunityId}` document. `confirmedInvitationId` is the winner. The other invitee has an `opportunity_closed` notification. Repeat 5×. Also: accept after the host cancelled → `closed`; accept when `startsAt` is in the past → `expired` |
+| `token.test.ts` | Signed-out get of a valid `inviteLinks/{token}` returns only the public fields (no host uid, no token field, no note). Unknown token → missing. `respondViaToken` as a non-invitee → `not_invitee`. As the invitee with `maybe` → response updated on the invitation and on the link. With `in` → confirms, and `matches/{opportunityId}` exists |
+| `confirm-result.test.ts` | For each §4 reference input, seed two profiles and a played singles match, run `confirmResult`, and assert both stored ratings and both `ratingHistory` rows equal `domain/elo.ts`. Doubles confirm leaves ratings unchanged. A second confirm returns `already_confirmed` |
+| `availability-rules.test.ts` | A connection can read João's availability; André (not connected) cannot. Publishing a compatible availability writes `availability_match` notifications for both players. A different location writes none |
+
+### 8.4 Acceptance checks (Playwright, localhost, seeded data)
+
+Seed (`npm run seed`, idempotent, also run by Playwright `globalSetup`). All users `*@test.local`, password `Password123!`. Dates are relative to "now" (next Saturday etc.) in `America/Sao_Paulo`.
+
+| User | Level / rating | Connections | Other seed |
+|---|---|---|---|
+| Guilherme | intermediate / 1500 initial; seed replays 3 results through `domain/elo.ts` so `rating`, `ratedMatches=3` and `ratingHistory` are consistent | João, Pedro, Lucas (accepted) | list "Saturday players" = João, Pedro, Lucas; locations Belvedere; 3 played+confirmed singles matches in last 30 days (beat João, lost to João, beat Pedro 25 days ago); 1 played match vs Lucas yesterday with no result (Phase 2) |
+| João | intermediate / 1520 initial (seed-adjusted) | Guilherme, Rafael | availability next Saturday 10:00–12:00, Belvedere, singles |
+| Pedro | intermediate / 1480 initial (seed-adjusted) | Guilherme | hosts open opportunity next Sunday 09:00 Belvedere singles inviting Guilherme + João |
+| Lucas | advanced / 1650 | Guilherme | — |
+| Rafael | intermediate / 1500 | João only | location Belvedere; openToNew |
+| André | intermediate / 1500 | none | openToNew |
+
+Locations: Belvedere, Minas Tênis Clube, Pampulha.
+
+Phase 0
+```
+1. Sign up + profile
+   - Open: /signup
+   - Do: register nova@test.local / Password123!, name "Nova Player", level Intermediate; on /onboarding pick "Belvedere"; continue
+   - Expect: land on /, header shows "Want to play?"; /profile shows "Nova Player", level "Intermediate", rating 1500, location Belvedere, 0 matches
+```
+Phase 1
+```
+2. Add connection
+   - Open: /network (as Guilherme)
+   - Do: search "André" → Connect; sign in as André → /inbox shows "Guilherme wants to connect" → open → Accept
+   - Expect: André's /network lists Guilherme under People you know; Guilherme's /network lists André; Guilherme's /inbox has "André accepted your connection"
+3. Create match list
+   - Open: /network/lists (as Guilherme)
+   - Do: New list "Belvedere crew"; add Lucas and Pedro
+   - Expect: /network/lists shows "Belvedere crew (2)"; list page shows Lucas, Pedro; André (not in list) absent
+4. Create opportunity and invite a list
+   - Open: /fix (as Guilherme)
+   - Do: pick next Saturday 10:00, 90 min, Belvedere, Singles, Who = list "Saturday players"; Send invitation
+   - Expect: redirected to /opportunities/[id]; shows "Saturday · 10:00 · Belvedere · Singles", status "Looking for an opponent", 3 invitee rows (João, Pedro, Lucas) each "Awaiting"
+5. Invitee sees it in inbox
+   - Open: /inbox (as João)
+   - Do: observe unread badge; click "Guilherme invited you to play Saturday 10:00 at Belvedere"
+   - Expect: lands on /opportunities/[id] with buttons I'm in / Maybe / Can't play
+6. wa.me link with correct prefilled text
+   - Open: /opportunities/[id] (as Guilherme, the opportunity from check 4)
+   - Do: read the href of "Share on WhatsApp" next to João (do not navigate)
+   - Expect: href starts with https://wa.me/?text=; decodeURIComponent(text) contains "João", "Singles", "Belvedere", the formatted Saturday date/time and "http://localhost:3000/i/" followed by João's token; opening /i/<that token> anonymously renders the same match details
+7. First "I'm in" confirms; host sees Match fixed
+   - Open: /opportunities/[id] (as João)
+   - Do: click "I'm in"
+   - Expect: João sees "Match fixed: Guilherme × João" and a link to /matches/[id]; Guilherme's /opportunities/[id] shows "Match fixed: Guilherme × João", João row "In"; Guilherme's /inbox has "Match confirmed"; / (Home) lists the upcoming match
+8. Other invitees see it closed
+   - Open: /opportunities/[id] (as Pedro)
+   - Do: observe
+   - Expect: no response buttons; text "Closed — Guilherme fixed this match with someone else"; Pedro's /inbox has "Opportunity closed"; accepting again as Lucas (second tab opened before confirmation, or a direct acceptInvitation call) shows "This match has already been fixed" and no second match exists
+9. Maybe / Can't play do not confirm
+   - Open: /fix (as Guilherme) → create a second opportunity next Sunday 16:00 Pampulha Singles inviting Pedro + Lucas
+   - Do: as Pedro click "Maybe"; as Lucas click "Can't play"
+   - Expect: host view shows Pedro "Maybe", Lucas "Can't play", status still "Looking for an opponent"; Pedro can change to "I'm in" afterwards and that confirms
+10. Tokenized link → sign in → respond
+   - Open: /i/<Guilherme's token for Pedro's seeded opportunity> in a fresh (logged-out) context
+   - Do: see details + "Sign in to respond"; sign in as Guilherme; click "I'm in"
+   - Expect: page shows "Match fixed: Pedro × Guilherme"; as João the same /i/<João's token> shows the closed message; as André, /i/<Guilherme's token> shows details read-only with "This invite was sent to Guilherme"
+11. Host cancels an open opportunity
+   - Open: /opportunities/[id] of the check-9 opportunity if still open (else create one) as Guilherme
+   - Do: Cancel
+   - Expect: status "Cancelled"; invitees see "closed_cancelled" text and no buttons; inbox notification "cancelled"
+```
+Phase 2
+```
+12. Record result
+   - Open: /matches/[id] (as Guilherme) for the seeded Guilherme × Lucas match (yesterday, Belvedere, no result)
+   - Do: "Record result" → winner Guilherme, score "6-4 6-3" → Save
+   - Expect: page shows "Result pending Lucas's confirmation"; Lucas's /inbox has "Guilherme reported a result"
+13. Opponent confirms → rating updates and history shows
+   - Open: /matches/[id] (as Lucas)
+   - Do: Confirm
+   - Expect: page shows "Confirmed", "Guilherme +N", "Lucas −M" where N and M are computed in the spec by importing domain/elo.ts with the pre-match ratings read from the page (Guilherme K=40 because ratedMatches=3, Lucas K=40 because ratedMatches=0; e.g. 1524 vs 1650 → Guilherme 1551 (+27), Lucas 1623 (−27)); Guilherme's /profile shows the new rating and the latest rating-history row "+N vs Lucas"; Lucas's profile shows his new rating; a second Confirm click does nothing (idempotent)
+14. Profile "Your tennis"
+   - Open: /profile (as Guilherme)
+   - Do: observe
+   - Expect: level label matches `levelForRating(rating)`, rating equals the value from check 13, "4 matches played", "4 in the last 30 days", "4 connections" (after check 2), match history lists Lucas, João ×2, Pedro, upcoming matches from Phase 1 listed separately
+```
+Phase 3
+```
+15. Publish availability → mutual-availability suggestion
+   - Open: /available/new (as Guilherme)
+   - Do: next Saturday 10:00–12:00, Belvedere, Singles → Make available
+   - Expect: /available shows the availability and a card "You and João are both available at Belvedere Saturday at 10:00" with "Fix a match"; clicking it opens /fix prefilled (Saturday 10:00, Belvedere, Singles, João selected); Guilherme's /inbox and João's /inbox each have an "availability_match" notification
+16. Availability visible only to connections
+   - Open: /players/<João id> (as André, not connected to João)
+   - Do: observe
+   - Expect: no availability shown; as Guilherme the same page shows "Available Saturday 10:00–12:00 at Belvedere"
+```
+Phase 4
+```
+17. Discovery shows 2nd-degree contact
+   - Open: /network → tab "People connected to people you know" (as Guilherme)
+   - Do: observe
+   - Expect: Rafael listed with "via João" and level "Intermediate"; Connect button present; Guilherme's own 1st-degree contacts not listed here
+18. Nearby compatible players
+   - Open: /network → tab "Nearby compatible" (as Guilherme)
+   - Do: observe
+   - Expect: Rafael listed (shares Belvedere, rating within 200 of Guilherme's, openToNew); André absent (no shared location)
+19. People currently available
+   - Open: /network → tab "Currently available" (as Guilherme)
+   - Do: observe
+   - Expect: João listed with "Saturday 10:00–12:00 · Belvedere · Singles" and "Fix a match" linking to /fix prefilled
+20. Motivation prompts on Home
+   - Open: / (as Guilherme)
+   - Do: observe prompts block
+   - Expect: shows "João is available Saturday at Belvedere" (CTA Fix a match), "You've played 4 times in the last 30 days" (or the current seeded count), "You haven't played Pedro in 3 weeks" (CTA Fix a match prefilled with Pedro); at most 3 prompts
+```
+
+### 8.5 E2E conventions
+- One spec file per phase; tests within a file run in order (`test.describe.configure({ mode: 'serial' })`), `workers: 1`. `globalSetup` runs `npm run seed` inside the emulator process. Helpers: `loginAs(page, 'joao')`, `asUser('pedro')` creating a new context with cached `storageState`.
+- Locate by role/text; the wa.me assertion reads `getAttribute('href')`.
+- Relative dates: helper `nextSaturday10()` shared by seed and specs.
+- The browser Firebase app uses the Auth and Firestore emulators. Production config is never loaded during `test:e2e`.
+
+### 8.6 Definition of done per phase
+
+| Phase | Gate |
+|---|---|
+| 0 | `lint`, `typecheck`, `build` green; `test`, `test:db` run (may be empty); check 1 |
+| 1 | + `opportunity.test.ts`, `whatsapp.test.ts`; `rules.test.ts`, `accept-concurrency.test.ts`, `token.test.ts`; checks 2–11 |
+| 2 | + `elo.test.ts`, `level.test.ts`, `confirm-result.test.ts`; checks 12–14; Phase 1 checks still green |
+| 3 | + `availability.test.ts`, `availability-rules.test.ts`; checks 15–16; earlier checks green |
+| 4 | + `prompts.test.ts`; checks 17–20; full suite green; Vercel preview deploy succeeds and `deploy:firebase` has applied the rules and indexes |
+
+Missing the §2 comments on domain files, page files, and `firestore.rules` is a review failure (no automated test for comments).
+
+## 9. Doc to update
+
+`README.md` (create in Phase 0, extend per phase): prerequisites (Node 24, JDK 21+, a Firebase project), env setup (`cp .env.example .env.local`), `npm run dev:emu` → http://localhost:3000, seeded logins table, test commands (§8.1), deploy notes (Vercel env vars, `npm run deploy:firebase`, Firestore location), phase status checklist. `README.md` must include the same "Read it in this order" list, kept in sync with §2, so the PM can start from the repo root.
+
+## 10. Not building (explicitly out of scope)
+
+- Everything in PRD §11: court booking, recurring matches, leagues/tournaments, coaching, groups/communities, social feed, streaks, richer stats.
+- Admin panel, payments, push-notification infra, email delivery, WhatsApp Business API / message sending (only the `wa.me` share link), SMS.
+- Inviting people who are not registered users (phone-number invites). Invitees must be accepted connections. The `/i/[token]` page still lets a not-yet-signed-in invitee sign in and respond.
+- Doubles coordination (3 slots, partners). `format=doubles` is a label; coordination is still "first accept fixes the match with one other person"; doubles results are recorded but unrated.
+- Geo search. "Nearby" = shares a preferred location.
+- Cloud Functions, Firestore triggers, and a separate API service. Notifications are written by the server action that caused them. Firebase App Hosting is unused; the Next.js app stays on Vercel.
+- A second rating implementation. `confirmResult` calls `domain/elo.ts`.
+- Realtime listeners are optional polish for the inbox badge only; nothing gates on them.
+- Rejected extras: ORM; a state-machine library (two small pure functions); a job scheduler for expiry (derived at read time); full-text search (prefix on `displayNameLower`).
+
+## 11. Risks & open questions
+
+Risks
+- The Admin SDK bypasses rules. A server action that forgets `requireUser()` or the allow/deny check can write anything. Mitigation: every action starts with `requireUser()`; rules tests cover the client SDK; transaction tests cover accept and confirm.
+- Rules and action checks can drift. Mitigation: §3 is the single matrix; `rules.test.ts` asserts the client cannot perform the forbidden writes.
+- Firestore queries fail entirely when a `where` clause is broader than the read rule. Availability and invitation reads must use the query shapes in §3.
+- `array-contains-any` and `in` are capped at 30 values. Connection-scoped reads query one `profileId` at a time, in waves of 30.
+- Two tabs accepting at once: the transaction retries, and `matches/{opportunityId}` can be created only once. The concurrency test repeats this five times.
+- Emulator vs hosted project: `NEXT_PUBLIC_FIREBASE_EMULATOR` and the emulator host variables must never be set on Vercel.
+- Email verification must stay off, and `localhost` must be an authorized domain, or the sign-up check fails.
+- Time zones: store UTC timestamps, render in the browser zone; seed and specs share date helpers in `America/Sao_Paulo`. Playwright fixes `timezoneId: 'America/Sao_Paulo'`.
+- "I'm in" and then a change of mind: no un-accept in the MVP. Cancelling the match (`matches.status = cancelled`) is the escape hatch. The opportunity stays confirmed.
+- JDK 21+ has to be installed for the Firestore emulator. Tests do not run against the hosted project.
+
+Open questions: none. The Firestore region is chosen with the user at Phase 0; the suggestion is `southamerica-east1`.
+
+**Decided**
+1. A confirmed match that is later cancelled does not reopen the opportunity. The host creates a new opportunity. `confirmed` and `cancelled` stay terminal.
+2. Invitees are restricted to accepted connections only.
+3. Focus on singles. Doubles is a label only (no 4-player coordination).
+4. Rating is visible to all authenticated users.
+5. Elo defaults in §4 (initial ratings, K-factors, level bands) stand for the MVP and can be adjusted after real results, not during the build.
+6. Next.js stays on Vercel. Firebase provides Auth and Firestore only.
+7. The public invite is a separate `inviteLinks/{token}` document with a fixed field list. Signed-out visitors can get that document and cannot list the collection.

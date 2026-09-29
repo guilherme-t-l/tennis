@@ -1,4 +1,7 @@
 # Tennis MVP — Implementation Plan
+BEFORE ANYTHING NOTE THAT THIS PLAN IS OVERLY COMPLEX, SHOULD ONLY SERVE AS REFERENCE AND ADDITIONAL CONTEXT, WE'RE NOT FOLLOWING IT EXACTLY.
+
+
 
 - PRD: `PRD-and-product-vision` (repo root). Status: Approved. Build scope = §6 features A–H, §10 MVP Experience. Metrics per §7 are derived from the data model below (no analytics infra).
 - Audience: implementer, code-reviewer, tester, qa threads, and the technical PM who reads the directory map and the in-code comments. This document + the PRD are the only inputs they get.
